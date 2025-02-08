@@ -1,2 +1,6 @@
 
 /SpaceX_Launches/node_modules
+/Authentication/backend/venv
+/Authentication/backend/__pycache__
+/Authentication/frontend/node_modules
+
