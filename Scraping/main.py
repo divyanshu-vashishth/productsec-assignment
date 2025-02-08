@@ -2,54 +2,54 @@ import requests
 from bs4 import BeautifulSoup
 import json
 import concurrent.futures
+import time
+from threading import Lock
+import os
 
 BASE_URL = "https://www.smashingmagazine.com"
 ARTICLES_URL = BASE_URL + "/articles/"
 OUTPUT_FILE = "smashingMagazineArticles.json"
+file_lock = Lock()  
 
-def get_article_links_from_page(url):
+def get_article_links_from_page(page_num):
     """
     Extracts article links from a single page of Smashing Magazine articles.
+    Returns tuple of (page_num, links)
     """
+    current_url = f"{ARTICLES_URL}page/{page_num}/" if page_num > 1 else ARTICLES_URL
     try:
-        response = requests.get(url)
-        response.raise_for_status()  #
+        time.sleep(0.5) 
+        response = requests.get(current_url)
+        if response.status_code == 404:
+            return (page_num, None)  
+            
+        response.raise_for_status()
         soup = BeautifulSoup(response.content, 'html.parser')
         articles = soup.select('article.article--post h2.article--post__title a')
         links = [BASE_URL + article['href'] for article in articles]
-        return links
+        print(f"Page {page_num}: Found {len(links)} articles")
+        return (page_num, links)
     except requests.exceptions.RequestException as e:
-        print(f"Error fetching URL {url}: {e}")
-        return []
+        print(f"Error fetching URL for page {page_num}: {e}")
+        return (page_num, [])
 
-def get_all_article_links():
+def get_all_article_links_parallel(max_pages=100):
     """
-    Scrapes all article links from paginated article pages.
+    Scrapes article links from all pages in parallel.
     """
     all_links = []
-    current_url = ARTICLES_URL
-    page_num = 1
-    while current_url:
-        print(f"Fetching links from page {page_num}: {current_url}")
-        links = get_article_links_from_page(current_url)
-        if not links:
-            break  
-        all_links.extend(links)
-
-        try:
-            response = requests.get(current_url)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.content, 'html.parser')
-            next_page_link = soup.select_one('a.next')
-            if next_page_link:
-                current_url = BASE_URL + next_page_link['href']
-                page_num += 1
-            else:
-                current_url = None 
-        except requests.exceptions.RequestException as e:
-            print(f"Error fetching next page link from {current_url}: {e}")
-            break 
-    return list(set(all_links))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        future_to_page = {executor.submit(get_article_links_from_page, page_num): page_num 
+                         for page_num in range(1, max_pages + 1)}
+        
+        for future in concurrent.futures.as_completed(future_to_page):
+            page_num, links = future.result()
+            if links is None:  
+                break
+            if links:
+                all_links.extend(links)
+                
+    return list(set(all_links))  
 
 def scrape_article_data(article_url):
     """
@@ -64,7 +64,9 @@ def scrape_article_data(article_url):
         "summary": None,
         "content": None
     }
+    
     try:
+        time.sleep(0.5)  # Polite delay
         response = requests.get(article_url)
         response.raise_for_status()
         soup = BeautifulSoup(response.content, 'html.parser')
@@ -81,61 +83,74 @@ def scrape_article_data(article_url):
         category_elements = soup.select('.meta-box--tags a')
         article_data["categories"] = [cat.text.strip() for cat in category_elements]
 
-        summary_element = soup.find('span', class_='summary__heading', string=lambda text: text and "Quick summary" in text.lower())
-        if summary_element:
-            summary_text_element = summary_element.find_next_sibling('p')
-            article_data["summary"] = summary_text_element.text.strip() if summary_text_element else None
-        else:
-             # Try to find summary in article teaser if "Quick Summary" is not present
-             teaser_element = soup.select_one('.article--post__teaser')
-             if teaser_element:
-                 article_data["summary"] = teaser_element.text.split('—')[-1].strip() if teaser_element.text.split('—') else None
-
-
-        content_element = soup.select_one('.article--single__content')
-        article_data["content"] = ''.join(p.text.strip() for p in content_element.select('p')) if content_element else None
-
         return article_data
 
     except requests.exceptions.RequestException as e:
         print(f"Error fetching article {article_url}: {e}")
-        return article_data 
+        return article_data
 
+def update_json_file(article_data):
+    """
+    Updates the JSON file with new article data in a thread-safe way.
+    """
+    with file_lock:
+        try:
+            # Read existing data
+            if os.path.exists(OUTPUT_FILE):
+                with open(OUTPUT_FILE, 'r', encoding='utf-8') as f:
+                    try:
+                        existing_data = json.load(f)
+                    except json.JSONDecodeError:
+                        existing_data = []
+            else:
+                existing_data = []
+
+            existing_data.append(article_data)
+            
+            with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
+                json.dump(existing_data, f, indent=4, ensure_ascii=False)
+                
+        except Exception as e:
+            print(f"Error updating JSON file: {e}")
+
+def process_article(article_url):
+    """
+    Process a single article and update the JSON file.
+    """
+    article_data = scrape_article_data(article_url)
+    update_json_file(article_data)
+    return article_data
 
 def scrape_articles_parallel(article_links):
     """
-    Scrapes article data in parallel using ThreadPoolExecutor.
+    Scrapes article data in parallel and continuously updates the JSON file.
     """
+    with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
+        json.dump([], f)
+
     articles_data = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor: 
-        futures = [executor.submit(scrape_article_data, link) for link in article_links]
-        for future in concurrent.futures.as_completed(futures):
-            articles_data.append(future.result())
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [executor.submit(process_article, link) for link in article_links]
+        total = len(futures)
+        for i, future in enumerate(concurrent.futures.as_completed(futures), 1):
+            article_data = future.result()
+            articles_data.append(article_data)
+            print(f"Processed {i}/{total} articles")
+    
     return articles_data
-
-
-def save_to_json(data, filename):
-    """
-    Saves scraped data to a JSON file.
-    """
-    with open(filename, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
 
 def main():
     """
-    Main function to run the scraper.
+    Main function to run the parallel scraper.
     """
-    print("Starting to scrape article links...")
-    article_links = get_all_article_links()
-    print(f"Found {len(article_links)} article links.")
+    print("Starting to scrape article links in parallel...")
+    article_links = get_all_article_links_parallel()
+    print(f"Found {len(article_links)} unique article links.")
 
-    print("Starting to scrape article data in parallel...")
+    print("Starting to scrape article data in parallel with continuous updates...")
     articles_data = scrape_articles_parallel(article_links)
     print("Article data scraping complete.")
-
-    print(f"Saving data to {OUTPUT_FILE}...")
-    save_to_json(articles_data, OUTPUT_FILE)
-    print(f"Data saved to {OUTPUT_FILE}")
+    print(f"Final data saved to {OUTPUT_FILE}")
 
 if __name__ == "__main__":
     main()
