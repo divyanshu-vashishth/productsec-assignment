@@ -3,4 +3,5 @@
 /Authentication/backend/venv
 /Authentication/backend/__pycache__
 /Authentication/frontend/node_modules
-
+/Scraping/venv
+/Scraping/__pycache__
